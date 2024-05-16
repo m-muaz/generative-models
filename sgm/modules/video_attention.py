@@ -166,6 +166,8 @@ class SpatialVideoTransformer(SpatialTransformer):
         disable_self_attn=False,
         disable_temporal_crossattention=False,
         max_time_embed_period: int = 10000,
+        temp_scale: int = 1,
+        spat_scale: int = 1,
     ):
         super().__init__(
             in_channels,
@@ -179,6 +181,11 @@ class SpatialVideoTransformer(SpatialTransformer):
             use_linear=use_linear,
             disable_self_attn=disable_self_attn,
         )
+        
+        # Spatial & Temporal Downsample factor
+        self.temp_scale = temp_scale
+        self.spat_scale = spat_scale
+        
         self.time_depth = time_depth
         self.depth = depth
         self.max_time_embed_period = max_time_embed_period
@@ -236,8 +243,10 @@ class SpatialVideoTransformer(SpatialTransformer):
         timesteps: Optional[int] = None,
         image_only_indicator: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        _, _, h, w = x.shape
+        batch_frames, c, h, w = x.shape
         x_in = x
+        num_frames_down = timesteps // self.temp_scale
+        batch_size = batch_frames // timesteps
         spatial_context = None
         if exists(context):
             spatial_context = context
@@ -279,15 +288,41 @@ class SpatialVideoTransformer(SpatialTransformer):
         for it_, (block, mix_block) in enumerate(
             zip(self.transformer_blocks, self.time_stack)
         ):
+            # Temporal downsampling using interpolation
+            x = (x[None, :].reshape(batch_size, timesteps, h, w, c).permute(0, 4, 1, 2, 3))
+            x = F.interpolate(x, size=[num_frames_down, h, w], mode="area")
+            x = x.permute(0, 2, 3, 4, 1).reshape(batch_size * num_frames_down, h * w, c)
+            
             x = block(
                 x,
                 context=spatial_context,
             )
+            
+            # Temporal upsampling using interpolation
+            x = (x[None, :].reshape(batch_size, num_frames_down, h, w, c).permute(0, 4, 1, 2, 3))
+            x = F.interpolate(x, size=[timesteps, h, w], mode="trilinear")
+            x = x.permute(0, 2, 3, 4, 1).reshape(batch_frames, h * w, c)
+
+
 
             x_mix = x
             x_mix = x_mix + emb
 
+            # Spatial downsample using interpolation
+            x_mix = (x_mix[None, :].reshape(batch_size, timesteps, h, w, c).permute(0, 4, 1, 2, 3))
+            spatial_up = tuple(x_mix.shape[3:])
+            x_mix = F.interpolate(x_mix, size=[timesteps, h // self.spat_scale, w // self.spat_scale], mode="trilinear")
+            *_, height, width = x_mix.shape 
+            x_mix = x_mix.permute(0, 2, 3, 4, 1).reshape(batch_frames, height * width, c)
+
             x_mix = mix_block(x_mix, context=time_context, timesteps=timesteps)
+            
+            # Spatial upsample using interpolation
+            x_mix = (x_mix[None, :].reshape(batch_size, timesteps, height, width, c).permute(0, 4, 1, 2, 3))
+            x_mix = F.interpolate(x_mix, size=[timesteps, spatial_up[0], spatial_up[1]], mode="trilinear")
+            *_, height, width = x_mix.shape
+            x_mix = x_mix.permute(0, 2, 3, 4, 1).reshape(batch_frames, height * width, c)
+             
             x = self.time_mixer(
                 x_spatial=x,
                 x_temporal=x_mix,

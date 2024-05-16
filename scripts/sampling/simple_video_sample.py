@@ -11,6 +11,7 @@ import imageio
 import numpy as np
 import torch
 from einops import rearrange, repeat
+from argparse import ArgumentParser
 from fire import Fire
 from omegaconf import OmegaConf
 from PIL import Image
@@ -124,8 +125,10 @@ def sample(
     else:
         raise ValueError
 
+    # print("Image paths", all_img_paths)
     for input_img_path in all_img_paths:
         if "sv3d" in version:
+            print(input_img_path)
             image = Image.open(input_img_path)
             if image.mode == "RGBA":
                 pass
@@ -256,7 +259,7 @@ def sample(
                 samples = torch.clamp((samples_x + 1.0) / 2.0, min=0.0, max=1.0)
 
                 os.makedirs(output_folder, exist_ok=True)
-                base_count = len(glob(os.path.join(output_folder, "*.mp4")))
+                base_count = len(glob(os.path.join(output_folder, "*.gif")))
 
                 imageio.imwrite(
                     os.path.join(output_folder, f"{base_count:06d}.jpg"), input_image
@@ -270,7 +273,7 @@ def sample(
                     .numpy()
                     .astype(np.uint8)
                 )
-                video_path = os.path.join(output_folder, f"{base_count:06d}.mp4")
+                video_path = os.path.join(output_folder, f"{base_count:06d}.gif")
                 imageio.mimwrite(video_path, vid)
 
 
@@ -344,6 +347,42 @@ def load_model(
     filter = DeepFloydDataFiltering(verbose=False, device=device)
     return model, filter
 
+def parse_arguments():
+    parser = ArgumentParser(description='Parse arguments for the simple_video_sample.')
+
+    parser.add_argument('--input_path', type=str, default="assets/test_image.png", 
+                        help='Can either be image file or folder with image files')
+    parser.add_argument('--num_frames', type=int, default=None, 
+                        help='Number of frames, 21 for SV3D')
+    parser.add_argument('--num_steps', type=int, default=None, 
+                        help='Number of steps')
+    parser.add_argument('--version', type=str, default="svd", 
+                        help='Version of the model')
+    parser.add_argument('--fps_id', type=int, default=6, 
+                        help='FPS ID')
+    parser.add_argument('--motion_bucket_id', type=int, default=127, 
+                        help='Motion bucket ID')
+    parser.add_argument('--cond_aug', type=float, default=0.02, 
+                        help='Conditional augmentation value')
+    parser.add_argument('--seed', type=int, default=23, 
+                        help='Random seed')
+    parser.add_argument('--decoding_t', type=int, default=14, 
+                        help='Number of frames decoded at a time. This eats most VRAM. Reduce if necessary.')
+    parser.add_argument('--device', type=str, default="cuda", 
+                        help='Device to run the model on')
+    parser.add_argument('--output_folder', type=str, default=None, 
+                        help='Folder to save outputs')
+    parser.add_argument('--elevations_deg', default=10.0, help='Elevation degrees for SV3D, can be a single float or a list of floats')
+    parser.add_argument('--azimuths_deg', default=None, help='Azimuth degrees for SV3D, a list of floats')
+    parser.add_argument('--image_frame_ratio', type=float, default=None, 
+                        help='Image to frame ratio')
+    parser.add_argument('--verbose', type=lambda s: s.lower() in ['True', 'true', '1', 'yes', 'y'], 
+                        default=False, help='Verbose mode')
+
+    args = parser.parse_args()
+    return args
 
 if __name__ == "__main__":
+    # args = parse_arguments()
+    # sample(**vars(args))
     Fire(sample)

@@ -115,9 +115,15 @@ class VideoUNet(nn.Module):
         adm_in_channels: Optional[int] = None,
         disable_temporal_crossattention: bool = False,
         max_ddpm_temb_period: int = 10000,
+        temp_scale: int = 1,
+        spat_scale: int = 1,
     ):
         super().__init__()
         assert context_dim is not None
+        
+        # Temporal and Spatial Downsampling & Upsampling scale
+        self.temp_scale = temp_scale
+        self.spat_scale = spat_scale
 
         if num_heads_upsample == -1:
             num_heads_upsample = num_heads
@@ -222,6 +228,8 @@ class VideoUNet(nn.Module):
                 disable_self_attn=disabled_sa,
                 disable_temporal_crossattention=disable_temporal_crossattention,
                 max_time_embed_period=max_ddpm_temb_period,
+                temp_scale=temp_scale,
+                spat_scale=spat_scale,
             )
 
         def get_resblock(
