@@ -1,0 +1,3 @@
+[submodule "tomesd"]
+	path = tomesd
+	url = https://github.com/dbolya/tomesd.git
