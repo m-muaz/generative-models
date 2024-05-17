@@ -19,7 +19,7 @@ from scripts.util.detection.nsfw_and_watermark_dectection import DeepFloydDataFi
 from sgm.inference.helpers import embed_watermark
 from sgm.util import default, instantiate_from_config
 from torchvision.transforms import ToTensor
-
+from tomesd import tomesd
 
 def sample(
     input_path: str = "assets/test_image.png",  # Can either be image file or folder with image files
@@ -95,13 +95,14 @@ def sample(
     else:
         raise ValueError(f"Version {version} does not exist.")
 
-    model, filter = load_model(
+    model, filter, config = load_model(
         model_config,
         device,
         num_frames,
         num_steps,
         verbose,
     )
+    tomesd.apply_patch(model, ratio=config.tome_sv3d.ratio, max_downsample=config.tome_sv3d.max_downsample)
     torch.manual_seed(seed)
 
     path = Path(input_path)
@@ -256,21 +257,24 @@ def sample(
                 samples = torch.clamp((samples_x + 1.0) / 2.0, min=0.0, max=1.0)
 
                 os.makedirs(output_folder, exist_ok=True)
-                base_count = len(glob(os.path.join(output_folder, "*.mp4")))
+                base_count = len(glob(os.path.join(output_folder, "*.gif")))
+                split_filename = (input_img_path.split('/')[-1]).split('.')
+                split_filename = '-'.join(split_filename[:-1])
+                out_filename_w_o_ext = split_filename + f"_{base_count:06d}"
 
                 imageio.imwrite(
-                    os.path.join(output_folder, f"{base_count:06d}.jpg"), input_image
+                    os.path.join(output_folder, f"{out_filename_w_o_ext}.jpg"), input_image
                 )
 
-                samples = embed_watermark(samples)
-                samples = filter(samples)
+                # samples = embed_watermark(samples)
+                # samples = filter(samples)
                 vid = (
                     (rearrange(samples, "t c h w -> t h w c") * 255)
                     .cpu()
                     .numpy()
                     .astype(np.uint8)
                 )
-                video_path = os.path.join(output_folder, f"{base_count:06d}.mp4")
+                video_path = os.path.join(output_folder, f"{out_filename_w_o_ext}.gif")
                 imageio.mimwrite(video_path, vid)
 
 
@@ -342,7 +346,7 @@ def load_model(
         model = instantiate_from_config(config.model).to(device).eval()
 
     filter = DeepFloydDataFiltering(verbose=False, device=device)
-    return model, filter
+    return model, filter, config
 
 
 if __name__ == "__main__":
