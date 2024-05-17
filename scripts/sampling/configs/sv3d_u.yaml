@@ -120,5 +120,5 @@ model:
             max_scale: 2.5
 
 tome_sv3d:
-  ratio: 0.1
-  max_downsample: 1
+  ratio: 0.2
+  max_downsample: 16

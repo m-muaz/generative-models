@@ -37,6 +37,7 @@ def sample(
     azimuths_deg: Optional[List[float]] = None,  # For SV3D
     image_frame_ratio: Optional[float] = None,
     verbose: Optional[bool] = False,
+    tomesd_ratio: Optional[float] = None,
 ):
     """
     Simple script to generate a single sample conditioned on an image `input_path` or multiple images, one for each
@@ -102,6 +103,9 @@ def sample(
         num_steps,
         verbose,
     )
+    # If tomesd_ratio is provided via command line, use that. Otherwise, use the one from config.
+    if tomesd_ratio is not None:
+        config.tome_sv3d.ratio = tomesd_ratio
     tomesd.apply_patch(model, ratio=config.tome_sv3d.ratio, max_downsample=config.tome_sv3d.max_downsample)
     torch.manual_seed(seed)
 
@@ -257,13 +261,19 @@ def sample(
                 samples = torch.clamp((samples_x + 1.0) / 2.0, min=0.0, max=1.0)
 
                 os.makedirs(output_folder, exist_ok=True)
-                base_count = len(glob(os.path.join(output_folder, "*.gif")))
-                split_filename = (input_img_path.split('/')[-1]).split('.')
+                
+                # Make an sub folder for tomesd
+                save_dir = os.path.join(output_folder, f"tome_ratio:{config.tome_sv3d.ratio}-max_downsample:{config.tome_sv3d.max_downsample}")
+                os.makedirs(save_dir, exist_ok=True)
+                
+                # Directory to save images
+                base_count = len(glob(os.path.join(save_dir, "*.gif")))
+                split_filename = (str(input_img_path).split('/')[-1]).split('.')
                 split_filename = '-'.join(split_filename[:-1])
                 out_filename_w_o_ext = split_filename + f"_{base_count:06d}"
 
                 imageio.imwrite(
-                    os.path.join(output_folder, f"{out_filename_w_o_ext}.jpg"), input_image
+                    os.path.join(save_dir, f"{out_filename_w_o_ext}.jpg"), input_image
                 )
 
                 # samples = embed_watermark(samples)
@@ -274,7 +284,7 @@ def sample(
                     .numpy()
                     .astype(np.uint8)
                 )
-                video_path = os.path.join(output_folder, f"{out_filename_w_o_ext}.gif")
+                video_path = os.path.join(save_dir, f"{out_filename_w_o_ext}.gif")
                 imageio.mimwrite(video_path, vid)
 
 
