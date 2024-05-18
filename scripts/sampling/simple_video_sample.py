@@ -128,6 +128,13 @@ def sample(
         device.type
     )
     
+    # If tomesd_ratio is provided via command line, use that. Otherwise, use the one from config.
+    if not bypass_tomesd:
+        # Allow tomesd to apply its patch
+        if tomesd_ratio is not None:
+            config.tome_sv3d.ratio = tomesd_ratio
+        tomesd.apply_patch(model, ratio=config.tome_sv3d.ratio, max_downsample=config.tome_sv3d.max_downsample)
+
     # Initialize the accelerator trackers
     if accelerator.is_main_process:
         # Make output directories
@@ -141,16 +148,9 @@ def sample(
             "name": exp_name,
             "dir": output_folder,
             "id": exp_name,
-            "resume": "allow",
         }
-        accelerator.init_trackers(project_name=logger_projectname, init_kwargs={logger_type: default_logger_cfg})
+        accelerator.init_trackers(project_name=logger_projectname, init_kwargs={config.logger: default_logger_cfg})
         
-    # If tomesd_ratio is provided via command line, use that. Otherwise, use the one from config.
-    if not bypass_tomesd:
-        # Allow tomesd to apply its patch
-        if tomesd_ratio is not None:
-            config.tome_sv3d.ratio = tomesd_ratio
-        tomesd.apply_patch(model, ratio=config.tome_sv3d.ratio, max_downsample=config.tome_sv3d.max_downsample)
     torch.manual_seed(seed)
 
     path = Path(input_path)
@@ -337,9 +337,9 @@ def sample(
     inference_outputs = gather_object(inference_outputs)
     
     # Log generations to wandb and save to disk
-    for idx, out in tqdm(enumerate(inference_outputs), desc="Logging inference results", total=len(inference_outputs)):
-        base_count = len(glob(os.path.join(save_dir, "*.gif")))
-        if accelerator.is_main_process:
+    if accelerator.is_main_process:
+        for idx, out in tqdm(enumerate(inference_outputs), desc="Logging inference results", total=len(inference_outputs)):
+            base_count = len(glob(os.path.join(save_dir, "*.gif")))
             out_filename_w_o_ext = out["image_name"] + f"_{base_count:06d}"
             imageio.imwrite(
                 os.path.join(save_dir, f"{out_filename_w_o_ext}.jpg"), out["img"]
@@ -349,14 +349,15 @@ def sample(
             
             # Log to accelerator trackers
             accelerator.log(
-                {f"{out_filename_w_o_ext}_tomesd:{out['tomesd_ratio']}": wandb.Video(out["vid"], fps=fps_id)},
+                {f"{out_filename_w_o_ext}_tomesd:{out['tomesd_ratio']}": wandb.Video(rearrange(out["vid"], "t h w c -> t c h w"), fps=fps_id)},
                 step=idx
             )
             accelerator.log(
                 {f"{out_filename_w_o_ext}": wandb.Image(out["img"])},
                 step=idx
             )
-            
+    
+    accelerator.end_training()
 
 
 def get_unique_embedder_keys_from_conditioner(conditioner):

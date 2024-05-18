@@ -122,3 +122,5 @@ model:
 tome_sv3d:
   ratio: 0.2
   max_downsample: 16
+
+logger: wandb
