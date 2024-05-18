@@ -13,5 +13,5 @@ for ratio in ${tomesd_token_ratios[@]}; do
         --version sv3d_u \
         --output_folder /blob/zyhe/muaz/output/sv3d_u \
         --tomesd_ratio ${ratio} \
-        --verbose True
+        --verbose True 2>&1 | tee /blob/zyhe/muaz/output/sv3d_u/tomesd_ratio_${ratio}.log
 done
