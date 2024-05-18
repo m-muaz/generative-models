@@ -10,7 +10,10 @@ import cv2
 import imageio
 import numpy as np
 import torch
+import wandb
 from einops import rearrange, repeat
+from accelerate import Accelerator
+from accelerate.utils import gather_object
 from fire import Fire
 from omegaconf import OmegaConf
 from PIL import Image
@@ -19,6 +22,7 @@ from scripts.util.detection.nsfw_and_watermark_dectection import DeepFloydDataFi
 from sgm.inference.helpers import embed_watermark
 from sgm.util import default, instantiate_from_config
 from torchvision.transforms import ToTensor
+from tqdm import tqdm
 from tomesd import tomesd
 
 def sample(
@@ -38,12 +42,18 @@ def sample(
     image_frame_ratio: Optional[float] = None,
     verbose: Optional[bool] = False,
     tomesd_ratio: Optional[float] = None,
+    bypass_tomesd: Optional[bool] = False,
+    logger_type: str = None,
+    logger_projectname: str = 'svd-eval',
+    exp_name: Optional[str] = None,
 ):
     """
     Simple script to generate a single sample conditioned on an image `input_path` or multiple images, one for each
     image file in folder `input_path`. If you run out of VRAM, try decreasing `decoding_t`.
     """
 
+    
+    
     if version == "svd":
         num_frames = default(num_frames, 14)
         num_steps = default(num_steps, 25)
@@ -95,18 +105,52 @@ def sample(
         azimuths_rad[:-1].sort()
     else:
         raise ValueError(f"Version {version} does not exist.")
-
-    model, filter, config = load_model(
+    
+    # Load config
+    config = load_config(
         model_config,
         device,
         num_frames,
         num_steps,
-        verbose,
+        verbose
     )
+    
+    # Add trackers to accelerator
+    if logger_type is not None:
+        config.logger = logger_type    
+    # Add accelerator for multi-gpu inference support and wandb logging
+    accelerator = Accelerator(log_with=config.logger, project_dir=output_folder)
+    
+    device = accelerator.device
+    
+    model, filter= load_model(
+        config,
+        device.type
+    )
+    
+    # Initialize the accelerator trackers
+    if accelerator.is_main_process:
+        # Make output directories
+        os.makedirs(output_folder, exist_ok=True)
+        # Make an sub folder for tomesd
+        save_dir = os.path.join(output_folder, f"tome_ratio:{config.tome_sv3d.ratio}-max_downsample:{config.tome_sv3d.max_downsample}")
+        os.makedirs(save_dir, exist_ok=True)
+        
+        os.environ["WANDB_DIR"] = output_folder
+        default_logger_cfg = {
+            "name": exp_name,
+            "dir": output_folder,
+            "id": exp_name,
+            "resume": "allow",
+        }
+        accelerator.init_trackers(project_name=logger_projectname, init_kwargs={logger_type: default_logger_cfg})
+        
     # If tomesd_ratio is provided via command line, use that. Otherwise, use the one from config.
-    if tomesd_ratio is not None:
-        config.tome_sv3d.ratio = tomesd_ratio
-    tomesd.apply_patch(model, ratio=config.tome_sv3d.ratio, max_downsample=config.tome_sv3d.max_downsample)
+    if not bypass_tomesd:
+        # Allow tomesd to apply its patch
+        if tomesd_ratio is not None:
+            config.tome_sv3d.ratio = tomesd_ratio
+        tomesd.apply_patch(model, ratio=config.tome_sv3d.ratio, max_downsample=config.tome_sv3d.max_downsample)
     torch.manual_seed(seed)
 
     path = Path(input_path)
@@ -129,163 +173,190 @@ def sample(
     else:
         raise ValueError
 
-    for input_img_path in all_img_paths:
-        if "sv3d" in version:
-            image = Image.open(input_img_path)
-            if image.mode == "RGBA":
-                pass
-            else:
-                # remove bg
-                image.thumbnail([768, 768], Image.Resampling.LANCZOS)
-                image = remove(image.convert("RGBA"), alpha_matting=True)
-
-            # resize object in frame
-            image_arr = np.array(image)
-            in_w, in_h = image_arr.shape[:2]
-            ret, mask = cv2.threshold(
-                np.array(image.split()[-1]), 0, 255, cv2.THRESH_BINARY
-            )
-            x, y, w, h = cv2.boundingRect(mask)
-            max_size = max(w, h)
-            side_len = (
-                int(max_size / image_frame_ratio)
-                if image_frame_ratio is not None
-                else in_w
-            )
-            padded_image = np.zeros((side_len, side_len, 4), dtype=np.uint8)
-            center = side_len // 2
-            padded_image[
-                center - h // 2 : center - h // 2 + h,
-                center - w // 2 : center - w // 2 + w,
-            ] = image_arr[y : y + h, x : x + w]
-            # resize frame to 576x576
-            rgba = Image.fromarray(padded_image).resize((576, 576), Image.LANCZOS)
-            # white bg
-            rgba_arr = np.array(rgba) / 255.0
-            rgb = rgba_arr[..., :3] * rgba_arr[..., -1:] + (1 - rgba_arr[..., -1:])
-            input_image = Image.fromarray((rgb * 255).astype(np.uint8))
-
-        else:
-            with Image.open(input_img_path) as image:
+    inference_outputs = []
+    with accelerator.split_between_processes(all_img_paths) as batched_image_paths:
+        for input_img_path in batched_image_paths:
+            if "sv3d" in version:
+                image = Image.open(input_img_path)
                 if image.mode == "RGBA":
-                    input_image = image.convert("RGB")
-                w, h = image.size
+                    pass
+                else:
+                    # remove bg
+                    image.thumbnail([768, 768], Image.Resampling.LANCZOS)
+                    image = remove(image.convert("RGBA"), alpha_matting=True)
 
-                if h % 64 != 0 or w % 64 != 0:
-                    width, height = map(lambda x: x - x % 64, (w, h))
-                    input_image = input_image.resize((width, height))
-                    print(
-                        f"WARNING: Your image is of size {h}x{w} which is not divisible by 64. We are resizing to {height}x{width}!"
+                # resize object in frame
+                image_arr = np.array(image)
+                in_w, in_h = image_arr.shape[:2]
+                ret, mask = cv2.threshold(
+                    np.array(image.split()[-1]), 0, 255, cv2.THRESH_BINARY
+                )
+                x, y, w, h = cv2.boundingRect(mask)
+                max_size = max(w, h)
+                side_len = (
+                    int(max_size / image_frame_ratio)
+                    if image_frame_ratio is not None
+                    else in_w
+                )
+                padded_image = np.zeros((side_len, side_len, 4), dtype=np.uint8)
+                center = side_len // 2
+                padded_image[
+                    center - h // 2 : center - h // 2 + h,
+                    center - w // 2 : center - w // 2 + w,
+                ] = image_arr[y : y + h, x : x + w]
+                # resize frame to 576x576
+                rgba = Image.fromarray(padded_image).resize((576, 576), Image.LANCZOS)
+                # white bg
+                rgba_arr = np.array(rgba) / 255.0
+                rgb = rgba_arr[..., :3] * rgba_arr[..., -1:] + (1 - rgba_arr[..., -1:])
+                input_image = Image.fromarray((rgb * 255).astype(np.uint8))
+
+            else:
+                with Image.open(input_img_path) as image:
+                    if image.mode == "RGBA":
+                        input_image = image.convert("RGB")
+                    w, h = image.size
+
+                    if h % 64 != 0 or w % 64 != 0:
+                        width, height = map(lambda x: x - x % 64, (w, h))
+                        input_image = input_image.resize((width, height))
+                        print(
+                            f"WARNING: Your image is of size {h}x{w} which is not divisible by 64. We are resizing to {height}x{width}!"
+                        )
+
+            image = ToTensor()(input_image)
+            image = image * 2.0 - 1.0
+
+            image = image.unsqueeze(0).to(device)
+            H, W = image.shape[2:]
+            assert image.shape[1] == 3
+            F = 8
+            C = 4
+            shape = (num_frames, C, H // F, W // F)
+            if (H, W) != (576, 1024) and "sv3d" not in version:
+                print(
+                    "WARNING: The conditioning frame you provided is not 576x1024. This leads to suboptimal performance as model was only trained on 576x1024. Consider increasing `cond_aug`."
+                )
+            if (H, W) != (576, 576) and "sv3d" in version:
+                print(
+                    "WARNING: The conditioning frame you provided is not 576x576. This leads to suboptimal performance as model was only trained on 576x576."
+                )
+            if motion_bucket_id > 255:
+                print(
+                    "WARNING: High motion bucket! This may lead to suboptimal performance."
+                )
+
+            if fps_id < 5:
+                print("WARNING: Small fps value! This may lead to suboptimal performance.")
+
+            if fps_id > 30:
+                print("WARNING: Large fps value! This may lead to suboptimal performance.")
+
+            value_dict = {}
+            value_dict["cond_frames_without_noise"] = image
+            value_dict["motion_bucket_id"] = motion_bucket_id
+            value_dict["fps_id"] = fps_id
+            value_dict["cond_aug"] = cond_aug
+            value_dict["cond_frames"] = image + cond_aug * torch.randn_like(image)
+            if "sv3d_p" in version:
+                value_dict["polars_rad"] = polars_rad
+                value_dict["azimuths_rad"] = azimuths_rad
+
+            with torch.no_grad():
+                with accelerator.autocast(): # torch.autocast(device) [Previously]
+                    batch, batch_uc = get_batch(
+                        get_unique_embedder_keys_from_conditioner(model.conditioner),
+                        value_dict,
+                        [1, num_frames],
+                        T=num_frames,
+                        device=device,
+                    )
+                    c, uc = model.conditioner.get_unconditional_conditioning(
+                        batch,
+                        batch_uc=batch_uc,
+                        force_uc_zero_embeddings=[
+                            "cond_frames",
+                            "cond_frames_without_noise",
+                        ],
                     )
 
-        image = ToTensor()(input_image)
-        image = image * 2.0 - 1.0
+                    for k in ["crossattn", "concat"]:
+                        uc[k] = repeat(uc[k], "b ... -> b t ...", t=num_frames)
+                        uc[k] = rearrange(uc[k], "b t ... -> (b t) ...", t=num_frames)
+                        c[k] = repeat(c[k], "b ... -> b t ...", t=num_frames)
+                        c[k] = rearrange(c[k], "b t ... -> (b t) ...", t=num_frames)
 
-        image = image.unsqueeze(0).to(device)
-        H, W = image.shape[2:]
-        assert image.shape[1] == 3
-        F = 8
-        C = 4
-        shape = (num_frames, C, H // F, W // F)
-        if (H, W) != (576, 1024) and "sv3d" not in version:
-            print(
-                "WARNING: The conditioning frame you provided is not 576x1024. This leads to suboptimal performance as model was only trained on 576x1024. Consider increasing `cond_aug`."
-            )
-        if (H, W) != (576, 576) and "sv3d" in version:
-            print(
-                "WARNING: The conditioning frame you provided is not 576x576. This leads to suboptimal performance as model was only trained on 576x576."
-            )
-        if motion_bucket_id > 255:
-            print(
-                "WARNING: High motion bucket! This may lead to suboptimal performance."
-            )
+                    randn = torch.randn(shape, device=device)
 
-        if fps_id < 5:
-            print("WARNING: Small fps value! This may lead to suboptimal performance.")
+                    additional_model_inputs = {}
+                    additional_model_inputs["image_only_indicator"] = torch.zeros(
+                        2, num_frames
+                    ).to(device)
+                    additional_model_inputs["num_video_frames"] = batch["num_video_frames"]
 
-        if fps_id > 30:
-            print("WARNING: Large fps value! This may lead to suboptimal performance.")
+                    def denoiser(input, sigma, c):
+                        return model.denoiser(
+                            model.model, input, sigma, c, **additional_model_inputs
+                        )
 
-        value_dict = {}
-        value_dict["cond_frames_without_noise"] = image
-        value_dict["motion_bucket_id"] = motion_bucket_id
-        value_dict["fps_id"] = fps_id
-        value_dict["cond_aug"] = cond_aug
-        value_dict["cond_frames"] = image + cond_aug * torch.randn_like(image)
-        if "sv3d_p" in version:
-            value_dict["polars_rad"] = polars_rad
-            value_dict["azimuths_rad"] = azimuths_rad
+                    samples_z = model.sampler(denoiser, randn, cond=c, uc=uc)
+                    model.en_and_decode_n_samples_a_time = decoding_t
+                    samples_x = model.decode_first_stage(samples_z)
+                    if "sv3d" in version:
+                        samples_x[-1:] = value_dict["cond_frames_without_noise"]
+                    samples = torch.clamp((samples_x + 1.0) / 2.0, min=0.0, max=1.0)
+                    
+                    # Directory to save images
+                    # base_count = len(glob(os.path.join(save_dir, "*.gif")))
+                    split_filename = (str(input_img_path).split('/')[-1]).split('.')
+                    split_filename = '-'.join(split_filename[:-1])
+                    # out_filename_w_o_ext = split_filename + f"_{base_count:06d}"
 
-        with torch.no_grad():
-            with torch.autocast(device):
-                batch, batch_uc = get_batch(
-                    get_unique_embedder_keys_from_conditioner(model.conditioner),
-                    value_dict,
-                    [1, num_frames],
-                    T=num_frames,
-                    device=device,
-                )
-                c, uc = model.conditioner.get_unconditional_conditioning(
-                    batch,
-                    batch_uc=batch_uc,
-                    force_uc_zero_embeddings=[
-                        "cond_frames",
-                        "cond_frames_without_noise",
-                    ],
-                )
+                    # imageio.imwrite(
+                    #     os.path.join(save_dir, f"{out_filename_w_o_ext}.jpg"), input_image
+                    # )
 
-                for k in ["crossattn", "concat"]:
-                    uc[k] = repeat(uc[k], "b ... -> b t ...", t=num_frames)
-                    uc[k] = rearrange(uc[k], "b t ... -> (b t) ...", t=num_frames)
-                    c[k] = repeat(c[k], "b ... -> b t ...", t=num_frames)
-                    c[k] = rearrange(c[k], "b t ... -> (b t) ...", t=num_frames)
-
-                randn = torch.randn(shape, device=device)
-
-                additional_model_inputs = {}
-                additional_model_inputs["image_only_indicator"] = torch.zeros(
-                    2, num_frames
-                ).to(device)
-                additional_model_inputs["num_video_frames"] = batch["num_video_frames"]
-
-                def denoiser(input, sigma, c):
-                    return model.denoiser(
-                        model.model, input, sigma, c, **additional_model_inputs
+                    # samples = embed_watermark(samples)
+                    # samples = filter(samples)
+                    vid = (
+                        (rearrange(samples, "t c h w -> t h w c") * 255)
+                        .cpu()
+                        .numpy()
+                        .astype(np.uint8)
                     )
-
-                samples_z = model.sampler(denoiser, randn, cond=c, uc=uc)
-                model.en_and_decode_n_samples_a_time = decoding_t
-                samples_x = model.decode_first_stage(samples_z)
-                if "sv3d" in version:
-                    samples_x[-1:] = value_dict["cond_frames_without_noise"]
-                samples = torch.clamp((samples_x + 1.0) / 2.0, min=0.0, max=1.0)
-
-                os.makedirs(output_folder, exist_ok=True)
-                
-                # Make an sub folder for tomesd
-                save_dir = os.path.join(output_folder, f"tome_ratio:{config.tome_sv3d.ratio}-max_downsample:{config.tome_sv3d.max_downsample}")
-                os.makedirs(save_dir, exist_ok=True)
-                
-                # Directory to save images
-                base_count = len(glob(os.path.join(save_dir, "*.gif")))
-                split_filename = (str(input_img_path).split('/')[-1]).split('.')
-                split_filename = '-'.join(split_filename[:-1])
-                out_filename_w_o_ext = split_filename + f"_{base_count:06d}"
-
-                imageio.imwrite(
-                    os.path.join(save_dir, f"{out_filename_w_o_ext}.jpg"), input_image
-                )
-
-                # samples = embed_watermark(samples)
-                # samples = filter(samples)
-                vid = (
-                    (rearrange(samples, "t c h w -> t h w c") * 255)
-                    .cpu()
-                    .numpy()
-                    .astype(np.uint8)
-                )
-                video_path = os.path.join(save_dir, f"{out_filename_w_o_ext}.gif")
-                imageio.mimwrite(video_path, vid)
+                    # video_path = os.path.join(save_dir, f"{out_filename_w_o_ext}.gif")
+                    # imageio.mimwrite(video_path, vid)
+                    
+                    inference_outputs.append({
+                        "vid": vid,
+                        "img": input_image,
+                        "tomesd_ratio": config.tome_sv3d.ratio,
+                        "image_name": split_filename,
+                    })
+                    
+    inference_outputs = gather_object(inference_outputs)
+    
+    # Log generations to wandb and save to disk
+    for idx, out in tqdm(enumerate(inference_outputs), desc="Logging inference results", total=len(inference_outputs)):
+        base_count = len(glob(os.path.join(save_dir, "*.gif")))
+        if accelerator.is_main_process:
+            out_filename_w_o_ext = out["image_name"] + f"_{base_count:06d}"
+            imageio.imwrite(
+                os.path.join(save_dir, f"{out_filename_w_o_ext}.jpg"), out["img"]
+            )
+            video_path = os.path.join(save_dir, f"{out_filename_w_o_ext}.gif")
+            imageio.mimwrite(video_path, out["vid"])
+            
+            # Log to accelerator trackers
+            accelerator.log(
+                {f"{out_filename_w_o_ext}_tomesd:{out['tomesd_ratio']}": wandb.Video(out["vid"], fps=fps_id)},
+                step=idx
+            )
+            accelerator.log(
+                {f"{out_filename_w_o_ext}": wandb.Image(out["img"])},
+                step=idx
+            )
+            
 
 
 def get_unique_embedder_keys_from_conditioner(conditioner):
@@ -331,7 +402,7 @@ def get_batch(keys, value_dict, N, T, device):
     return batch, batch_uc
 
 
-def load_model(
+def load_config(
     config: str,
     device: str,
     num_frames: int,
@@ -349,6 +420,12 @@ def load_model(
     config.model.params.sampler_config.params.guider_config.params.num_frames = (
         num_frames
     )
+    return config
+
+def load_model(
+    config, 
+    device: str
+):
     if device == "cuda":
         with torch.device(device):
             model = instantiate_from_config(config.model).to(device).eval()
@@ -356,7 +433,7 @@ def load_model(
         model = instantiate_from_config(config.model).to(device).eval()
 
     filter = DeepFloydDataFiltering(verbose=False, device=device)
-    return model, filter, config
+    return model, filter
 
 
 if __name__ == "__main__":
