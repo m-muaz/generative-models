@@ -41,7 +41,9 @@ def sample(
     azimuths_deg: Optional[List[float]] = None,  # For SV3D
     image_frame_ratio: Optional[float] = None,
     verbose: Optional[bool] = False,
-    tomesd_ratio: Optional[float] = None,
+    fm_ratio: Optional[float] = None,
+    tm_ratio: Optional[float] = None,
+    bm_ratio: Optional[float] = None,
     bypass_tomesd: Optional[bool] = False,
     logger_type: str = None,
     logger_projectname: str = 'svd-eval',
@@ -131,16 +133,21 @@ def sample(
     # If tomesd_ratio is provided via command line, use that. Otherwise, use the one from config.
     if not bypass_tomesd:
         # Allow tomesd to apply its patch
-        if tomesd_ratio is not None:
-            config.tome_sv3d.ratio = tomesd_ratio
-        tomesd.apply_patch(model, ratio=config.tome_sv3d.ratio, max_downsample=config.tome_sv3d.max_downsample)
+        if fm_ratio is not None:
+            config.tome_sv3d.fm_ratio = fm_ratio
+        if tm_ratio is not None:
+            config.tome_sv3d.tm_ratio = tm_ratio
+        if bm_ratio is not None:
+            config.tome_sv3d.bm_ratio = bm_ratio
+        config.tome_sv3d.num_frames = num_frames
+        tomesd.apply_patch(model, **config.tome_sv3d)
 
     # Initialize the accelerator trackers
     if accelerator.is_main_process:
         # Make output directories
         os.makedirs(output_folder, exist_ok=True)
         # Make an sub folder for tomesd
-        save_dir = os.path.join(output_folder, f"tome_ratio:{config.tome_sv3d.ratio}-max_downsample:{config.tome_sv3d.max_downsample}")
+        save_dir = os.path.join(output_folder, f"fm:{config.tome_sv3d.fm_ratio}_tm:{config.tome_sv3d.tm_ratio}_bm:{config.tome_sv3d.bm_ratio}-max_downsample:{config.tome_sv3d.max_downsample}")
         os.makedirs(save_dir, exist_ok=True)
         
         os.environ["WANDB_DIR"] = output_folder
@@ -330,7 +337,6 @@ def sample(
                     inference_outputs.append({
                         "vid": vid,
                         "img": input_image,
-                        "tomesd_ratio": config.tome_sv3d.ratio,
                         "image_name": split_filename,
                     })
                     
@@ -349,7 +355,7 @@ def sample(
             
             # Log to accelerator trackers
             accelerator.log(
-                {f"{out_filename_w_o_ext}_tomesd:{out['tomesd_ratio']}": wandb.Video(rearrange(out["vid"], "t h w c -> t c h w"), fps=fps_id)},
+                {f"{out_filename_w_o_ext}": wandb.Video(rearrange(out["vid"], "t h w c -> t c h w"), fps=fps_id)},
                 step=idx
             )
             accelerator.log(
