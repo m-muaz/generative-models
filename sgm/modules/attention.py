@@ -471,6 +471,9 @@ class BasicTransformerBlock(nn.Module):
         disable_self_attn=False,
         attn_mode="softmax",
         sdp_backend=None,
+        height=None, # only used for tomesd patch
+        width=None, # only used for tomesd patch
+        num_frames=None,# only used for tomesd patch
     ):
         super().__init__()
         assert attn_mode in self.ATTENTION_MODES
@@ -523,6 +526,34 @@ class BasicTransformerBlock(nn.Module):
         self.checkpoint = checkpoint
         if self.checkpoint:
             logpy.debug(f"{self.__class__.__name__} is using checkpointing")
+            
+        self._height = height
+        self._width = width
+        self._num_frames = num_frames
+    
+    @property
+    def height(self):
+        return self._height
+    
+    @height.setter
+    def height(self, value):
+        self._height = value
+        
+    @property
+    def width(self):
+        return self._width
+    
+    @width.setter
+    def width(self, value):
+        self._width = value
+    
+    @property
+    def num_frames(self):
+        return self._num_frames
+
+    @num_frames.setter
+    def num_frames(self, value):
+        self._num_frames = value
 
     def forward(
         self, x, context=None, additional_tokens=None, n_times_crossframe_attn_in_self=0
@@ -640,6 +671,9 @@ class SpatialTransformer(nn.Module):
         use_checkpoint=True,
         # sdp_backend=SDPBackend.FLASH_ATTENTION
         sdp_backend=None,
+        height=None, # only used for tomesd patch
+        width=None, # only used for tomesd patch
+        num_frames=None,# only used for tomesd patch
     ):
         super().__init__()
         logpy.debug(
@@ -698,7 +732,41 @@ class SpatialTransformer(nn.Module):
             # self.proj_out = zero_module(nn.Linear(in_channels, inner_dim))
             self.proj_out = zero_module(nn.Linear(inner_dim, in_channels))
         self.use_linear = use_linear
-
+        
+        self._height = height
+        self._width = width
+        self._num_frames = num_frames
+    
+    @property
+    def height(self):
+        return self._height
+    
+    @height.setter
+    def height(self, value):
+        self._height = value
+    
+    @property
+    def width(self):
+        return self._width
+    
+    @width.setter
+    def width(self, value):
+        self._width = value
+    
+    @property
+    def num_frames(self):
+        return self._num_frames
+    
+    @num_frames.setter
+    def num_frames(self, value):
+        self._num_frames = value
+    
+    def pass_hwf_to_basic_transformer(self):
+        for block in self.transformer_blocks:
+            block.height = self.height
+            block.width = self.width
+            block.num_frames = self.num_frames
+        
     def forward(self, x, context=None):
         # note: if no context is given, cross-attention defaults to self-attention
         if not isinstance(context, list):

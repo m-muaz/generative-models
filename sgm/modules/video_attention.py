@@ -2,7 +2,7 @@ import torch
 
 from ..modules.attention import *
 from ..modules.diffusionmodules.util import (AlphaBlender, linear,
-                                             timestep_embedding)
+                                            timestep_embedding)
 
 
 class TimeMixSequential(nn.Sequential):
@@ -237,6 +237,13 @@ class SpatialVideoTransformer(SpatialTransformer):
         image_only_indicator: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         _, _, h, w = x.shape
+        
+        # pass in h, w, num_frames to SpatialTransformer (for tomesd patch)
+        self.height = h
+        self.width = w
+        self.num_frames = timesteps
+        self.pass_hwf_to_basic_transformer()
+        
         x_in = x
         spatial_context = None
         if exists(context):
