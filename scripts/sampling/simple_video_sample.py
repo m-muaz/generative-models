@@ -147,7 +147,10 @@ def sample(
         # Make output directories
         os.makedirs(output_folder, exist_ok=True)
         # Make an sub folder for tomesd
-        save_dir = os.path.join(output_folder, f"fm:{config.tome_sv3d.fm_ratio}_tm:{config.tome_sv3d.tm_ratio}_bm:{config.tome_sv3d.bm_ratio}-max_downsample:{config.tome_sv3d.max_downsample}")
+        if bypass_tomesd:
+            save_dir = os.path.join(output_folder, "no_compression")
+        else:
+            save_dir = os.path.join(output_folder, f"fm:{config.tome_sv3d.fm_ratio}_tm:{config.tome_sv3d.tm_ratio}_bm:{config.tome_sv3d.bm_ratio}-max_downsample:{config.tome_sv3d.max_downsample}")
         os.makedirs(save_dir, exist_ok=True)
         
         os.environ["WANDB_DIR"] = output_folder
@@ -159,6 +162,8 @@ def sample(
         accelerator.init_trackers(project_name=logger_projectname, init_kwargs={config.logger: default_logger_cfg})
         
     torch.manual_seed(seed)
+    
+    
 
     path = Path(input_path)
     all_img_paths = []
@@ -355,11 +360,11 @@ def sample(
             
             # Log to accelerator trackers
             accelerator.log(
-                {f"{out_filename_w_o_ext}": wandb.Video(rearrange(out["vid"], "t h w c -> t c h w"), fps=fps_id)},
+                {f"{out_filename_w_o_ext}_output": wandb.Video(rearrange(out["vid"], "t h w c -> t c h w"), fps=fps_id)},
                 step=idx
             )
             accelerator.log(
-                {f"{out_filename_w_o_ext}": wandb.Image(out["img"])},
+                {f"{out_filename_w_o_ext}_input": wandb.Image(out["img"])},
                 step=idx
             )
     

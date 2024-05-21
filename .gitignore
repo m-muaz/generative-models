@@ -12,6 +12,7 @@
 /outputs
 /build
 /src
+/log
 
 # vscode
 .vscode
