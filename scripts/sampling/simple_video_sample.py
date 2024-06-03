@@ -11,19 +11,21 @@ import imageio
 import numpy as np
 import torch
 import wandb
-from einops import rearrange, repeat
 from accelerate import Accelerator
 from accelerate.utils import gather_object
+from einops import rearrange, repeat
 from fire import Fire
 from omegaconf import OmegaConf
 from PIL import Image
 from rembg import remove
+from torchvision.transforms import ToTensor
+from tqdm import tqdm
+
 from scripts.util.detection.nsfw_and_watermark_dectection import DeepFloydDataFiltering
 from sgm.inference.helpers import embed_watermark
 from sgm.util import default, instantiate_from_config
-from torchvision.transforms import ToTensor
-from tqdm import tqdm
 from tomesd import tomesd
+
 
 def sample(
     input_path: str = "assets/test_image.png",  # Can either be image file or folder with image files
@@ -352,11 +354,11 @@ def sample(
         for idx, out in tqdm(enumerate(inference_outputs), desc="Logging inference results", total=len(inference_outputs)):
             base_count = len(glob(os.path.join(save_dir, "*.gif")))
             out_filename_w_o_ext = out["image_name"] + f"_{base_count:06d}"
-            imageio.imwrite(
-                os.path.join(save_dir, f"{out_filename_w_o_ext}.jpg"), out["img"]
-            )
+            # imageio.imwrite(
+            #     os.path.join(save_dir, f"{out_filename_w_o_ext}.jpg"), out["img"]
+            # )
             video_path = os.path.join(save_dir, f"{out_filename_w_o_ext}.gif")
-            imageio.mimwrite(video_path, out["vid"])
+            imageio.mimwrite(video_path, out["vid"], loop=0, duration=1/fps_id)
             
             # Log to accelerator trackers
             accelerator.log(

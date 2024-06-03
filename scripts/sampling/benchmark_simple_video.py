@@ -51,6 +51,7 @@ def sample(
     tm_ratio: Optional[float] = None,
     bm_ratio: Optional[float] = None,
     bypass_tomesd: Optional[bool] = False,
+    bypass_saving: Optional[bool] = False,
     logger_type: str = None,
     logger_projectname: str = 'svd-eval',
     exp_name: Optional[str] = None,
@@ -151,11 +152,12 @@ def sample(
         # Make output directories
         os.makedirs(output_folder, exist_ok=True)
         # Make an sub folder for tomesd
-        if bypass_tomesd:
-            save_dir = os.path.join(output_folder, "no_compression")
-        else:
-            save_dir = os.path.join(output_folder, f"fm:{config.tome_sv3d.fm_ratio}_tm:{config.tome_sv3d.tm_ratio}_bm:{config.tome_sv3d.bm_ratio}-max_downsample:{config.tome_sv3d.max_downsample}")
-        os.makedirs(save_dir, exist_ok=True)
+        if not bypass_saving:
+            if bypass_tomesd:
+                save_dir = os.path.join(output_folder, "no_compression")
+            else:
+                save_dir = os.path.join(output_folder, f"fm:{config.tome_sv3d.fm_ratio}_tm:{config.tome_sv3d.tm_ratio}_bm:{config.tome_sv3d.bm_ratio}-max_downsample:{config.tome_sv3d.max_downsample}")
+            os.makedirs(save_dir, exist_ok=True)
 
         os.environ["WANDB_DIR"] = output_folder
         default_logger_cfg = {
@@ -187,6 +189,11 @@ def sample(
     else:
         raise ValueError
 
+    # batch size
+    bs = config.get("batch_size")
+    bs = default(bs, 10)
+    print("Batch size", bs)
+    
     inference_outputs = []
     with accelerator.split_between_processes(all_img_paths) as batched_image_paths:
         for input_img_path in batched_image_paths:
@@ -246,87 +253,104 @@ def sample(
             assert image.shape[1] == 3
             F = 8
             C = 4
-            shape = (num_frames, C, H // F, W // F)
-            if (H, W) != (576, 1024) and "sv3d" not in version:
-                print(
-                    "WARNING: The conditioning frame you provided is not 576x1024. This leads to suboptimal performance as model was only trained on 576x1024. Consider increasing `cond_aug`."
-                )
-            if (H, W) != (576, 576) and "sv3d" in version:
-                print(
-                    "WARNING: The conditioning frame you provided is not 576x576. This leads to suboptimal performance as model was only trained on 576x576."
-                )
-            if motion_bucket_id > 255:
-                print(
-                    "WARNING: High motion bucket! This may lead to suboptimal performance."
-                )
-
-            if fps_id < 5:
-                print("WARNING: Small fps value! This may lead to suboptimal performance.")
-
-            if fps_id > 30:
-                print("WARNING: Large fps value! This may lead to suboptimal performance.")
-
-            value_dict = {}
-            value_dict["cond_frames_without_noise"] = image
-            value_dict["motion_bucket_id"] = motion_bucket_id
-            value_dict["fps_id"] = fps_id
-            value_dict["cond_aug"] = cond_aug
-            value_dict["cond_frames"] = image + cond_aug * torch.randn_like(image)
-            if "sv3d_p" in version:
-                value_dict["polars_rad"] = polars_rad
-                value_dict["azimuths_rad"] = azimuths_rad
-
-            batch, batch_uc = get_batch(
-                get_unique_embedder_keys_from_conditioner(model.conditioner),
-                value_dict,
-                [1, num_frames],
-                T=num_frames,
-                device=device,
-            )
-            c, uc = model.conditioner.get_unconditional_conditioning(
-                batch,
-                batch_uc=batch_uc,
-                force_uc_zero_embeddings=[
-                    "cond_frames",
-                    "cond_frames_without_noise",
-                ],
-            )
-
-            for k in ["crossattn", "concat"]:
-                uc[k] = repeat(uc[k], "b ... -> b t ...", t=num_frames)
-                uc[k] = rearrange(uc[k], "b t ... -> (b t) ...", t=num_frames)
-                c[k] = repeat(c[k], "b ... -> b t ...", t=num_frames)
-                c[k] = rearrange(c[k], "b t ... -> (b t) ...", t=num_frames)
-
-            # get inference time results
-
-            # latencies = get_inference_time(
-            #     accelerator,
-            #     model,
-            #     batch,
-            #     shape,
-            #     num_frames,
-            #     device,
-            #     uc,
-            #     c,
-            #     decoding_t,
-            #     n_repeats=1,
-            # )
             
-            # print("In sample function--Latency of video generation:", latencies)
-            
-            memory_used =  get_inference_memory(
-                accelerator,
-                model,
-                batch,
-                shape,
-                num_frames,
-                device,
-                uc,
-                c,
-                decoding_t,
-            )
-            print(f"Memory used during inference: {memory_used:.2f} GB")
+            while True and (bs > 0):
+                print("-"*50)
+                print("Testing batch size",bs)
+                print("-"*50)
+                shape = (bs * num_frames, C, H // F, W // F)
+                if (H, W) != (576, 1024) and "sv3d" not in version:
+                    print(
+                        "WARNING: The conditioning frame you provided is not 576x1024. This leads to suboptimal performance as model was only trained on 576x1024. Consider increasing `cond_aug`."
+                    )
+                if (H, W) != (576, 576) and "sv3d" in version:
+                    print(
+                        "WARNING: The conditioning frame you provided is not 576x576. This leads to suboptimal performance as model was only trained on 576x576."
+                    )
+                if motion_bucket_id > 255:
+                    print(
+                        "WARNING: High motion bucket! This may lead to suboptimal performance."
+                    )
+
+                if fps_id < 5:
+                    print("WARNING: Small fps value! This may lead to suboptimal performance.")
+
+                if fps_id > 30:
+                    print("WARNING: Large fps value! This may lead to suboptimal performance.")
+                    
+                # Clone and repeat the image across batch dimension for multi batch inference
+                # print("Image shape", image.shape)
+                # image = repeat(image, "b ... -> (bs b) ...", b=image.shape[0], bs=bs)
+
+                value_dict = {}
+                value_dict["cond_frames_without_noise"] = image
+                value_dict["motion_bucket_id"] = motion_bucket_id
+                value_dict["fps_id"] = fps_id
+                value_dict["cond_aug"] = cond_aug
+                value_dict["cond_frames"] = image + cond_aug * torch.randn_like(image)
+                if "sv3d_p" in version:
+                    value_dict["polars_rad"] = polars_rad
+                    value_dict["azimuths_rad"] = azimuths_rad
+
+                batch, batch_uc = get_batch(
+                    get_unique_embedder_keys_from_conditioner(model.conditioner),
+                    value_dict,
+                    [bs, num_frames],
+                    T=num_frames,
+                    device=device,
+                )
+                c, uc = model.conditioner.get_unconditional_conditioning(
+                    batch,
+                    batch_uc=batch_uc,
+                    force_uc_zero_embeddings=[
+                        "cond_frames",
+                        "cond_frames_without_noise",
+                    ],
+                )
+
+                for k in ["crossattn", "concat"]:
+                    uc[k] = repeat(uc[k], "b ... -> b t ...", t=num_frames)
+                    uc[k] = rearrange(uc[k], "b t ... -> (b t) ...", t=num_frames)
+                    c[k] = repeat(c[k], "b ... -> b t ...", t=num_frames)
+                    c[k] = rearrange(c[k], "b t ... -> (b t) ...", t=num_frames)
+
+                # get inference time results
+
+                # latencies = get_inference_time(
+                #     accelerator,
+                #     model,
+                #     batch,
+                #     shape,
+                #     num_frames,
+                #     device,
+                #     uc,
+                #     c,
+                #     decoding_t,
+                #     n_repeats=1,
+                # )
+                
+                # print("In sample function--Latency of video generation:", latencies)
+                
+                memory_used =  get_inference_memory(
+                    accelerator,
+                    model,
+                    batch,
+                    shape,
+                    num_frames,
+                    device,
+                    uc,
+                    c,
+                    decoding_t,
+                )
+                if memory_used > 0.0:
+                    print(f"Max batch size supported {bs}")
+                    print(f"Memory used during inference: {memory_used:.2f} GB")
+                    break
+                else:
+                    bs -= 1 # Reduce batch size by 1
+                    
+
+                print(f"Memory used during inference: {memory_used:.2f} GB")
 
 
             # model.en_and_decode_n_samples_a_time = decoding_t
@@ -389,7 +413,8 @@ def get_batch(keys, value_dict, N, T, device):
                 b=math.prod(N),
             )
         elif key == "cond_frames" or key == "cond_frames_without_noise":
-            batch[key] = repeat(value_dict[key], "1 ... -> b ...", b=N[0])
+            batch[key] = repeat(value_dict[key], "bs ... -> bs b ...", b=N[0], bs=value_dict[key].shape[0])
+            batch[key] = rearrange(batch[key], "bs b ... -> (bs b) ...")
         elif key == "polars_rad" or key == "azimuths_rad":
             batch[key] = torch.tensor(value_dict[key]).to(device).repeat(N[0])
         else:
@@ -445,7 +470,7 @@ def do_inference(accelerator, model, batch, shape, num_frames, device, uc, c, de
 
             additional_model_inputs = {}
             additional_model_inputs["image_only_indicator"] = torch.zeros(
-                2, num_frames
+                2*(shape[0]//num_frames), num_frames
             ).to(device)
             additional_model_inputs["num_video_frames"] = batch["num_video_frames"]
 
@@ -455,8 +480,13 @@ def do_inference(accelerator, model, batch, shape, num_frames, device, uc, c, de
                 )
 
             samples_z = model.sampler(denoiser, randn, cond=c, uc=uc)
+            if samples_z is None: # cuda OOM error occured at that batch size
+                print(f"cuda OOM error occured at batch size {shape[0]//num_frames}!")
+                return None
             model.en_and_decode_n_samples_a_time = decoding_t
             samples_x = model.decode_first_stage(samples_z)
+            # Reshape samples_x to be of shape (bs, num_frames, C, H, W)
+            samples_x = rearrange(samples_x, "(bs t) c h w -> bs t c h w", t=num_frames)
 
     return samples_z
 
@@ -525,6 +555,9 @@ def get_inference_memory(accelerator, model, batch, shape, num_frames, device, u
     # Perform inference multiple times to get an average memory usage
     for _ in range(n_repeats):
         outputs = do_inference(accelerator, model, batch, shape, num_frames, device, uc, c, decoding_t)
+    
+    if outputs is None: # cuda OOM error occured
+        return -1
     
     # Get the peak memory usage
     mem = torch.cuda.max_memory_reserved(device)

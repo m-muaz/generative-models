@@ -117,15 +117,21 @@ class EDMSampler(SingleStepDiffusionSampler):
                 if self.s_tmin <= sigmas[i] <= self.s_tmax
                 else 0.0
             )
-            x = self.sampler_step(
-                s_in * sigmas[i],
-                s_in * sigmas[i + 1],
-                denoiser,
-                x,
-                cond,
-                uc,
-                gamma,
-            )
+            # try to denoise the current state (if CUDA OOM error occurs, exit the sampler and return to the main loop)
+            try:
+                x = self.sampler_step(
+                    s_in * sigmas[i],
+                    s_in * sigmas[i + 1],
+                    denoiser,
+                    x,
+                    cond,
+                    uc,
+                    gamma,
+                )
+            except torch.cuda.OutOfMemoryError as e:
+                print("CUDA out of memory. Error:", e)
+                torch.cuda.empty_cache()
+                return None
 
         return x
 
