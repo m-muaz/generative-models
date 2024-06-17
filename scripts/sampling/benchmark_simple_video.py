@@ -24,6 +24,7 @@ from PIL import Image
 from rembg import remove
 from torchvision.transforms import ToTensor
 from tqdm import tqdm
+from packaging import version
 
 from scripts.util.detection.nsfw_and_watermark_dectection import DeepFloydDataFiltering
 from sgm.inference.helpers import embed_watermark
@@ -126,7 +127,7 @@ def sample(
     if logger_type is not None:
         config.logger = logger_type    
     # Add accelerator for multi-gpu inference support and wandb logging
-    accelerator = Accelerator(log_with=config.logger, project_dir=output_folder)
+    accelerator = Accelerator(log_with=config.logger, project_dir=output_folder, mixed_precision="fp16")
 
     device = accelerator.device
 
@@ -191,7 +192,7 @@ def sample(
 
     # batch size
     bs = config.get("batch_size")
-    bs = default(bs, 10)
+    bs = default(bs, 20)
     print("Batch size", bs)
     
     inference_outputs = []
@@ -245,7 +246,11 @@ def sample(
                             f"WARNING: Your image is of size {h}x{w} which is not divisible by 64. We are resizing to {height}x{width}!"
                         )
 
+            wgt_dtype = torch.float16 # Float16
+            model=model.to(dtype=wgt_dtype)
+            
             image = ToTensor()(input_image)
+            image = image.to(dtype=wgt_dtype)
             image = image * 2.0 - 1.0
 
             image = image.unsqueeze(0).to(device)
@@ -330,7 +335,6 @@ def sample(
                 # )
                 
                 # print("In sample function--Latency of video generation:", latencies)
-                
                 memory_used =  get_inference_memory(
                     accelerator,
                     model,
@@ -342,15 +346,17 @@ def sample(
                     c,
                     decoding_t,
                 )
-                if memory_used > 0.0:
+                print(memory_used)
+                if memory_used['peak_mem'] > 0.0:
                     print(f"Max batch size supported {bs}")
-                    print(f"Memory used during inference: {memory_used:.2f} GB")
+                    print(f"Peak Memory used during inference: {memory_used['peak_mem']:.2f} GB")
+                    print(f"Reserved Memory used during inference: {memory_used['reserved_mem']:.2f} GB")
                     break
                 else:
                     bs -= 1 # Reduce batch size by 1
                     
 
-                print(f"Memory used during inference: {memory_used:.2f} GB")
+                # print(f"Memory used during inference: {memory_used:.2f} GB")
 
 
             # model.en_and_decode_n_samples_a_time = decoding_t
@@ -389,7 +395,7 @@ def get_unique_embedder_keys_from_conditioner(conditioner):
     return list(set([x.input_key for x in conditioner.embedders]))
 
 
-def get_batch(keys, value_dict, N, T, device):
+def get_batch(keys, value_dict, N, T, device, wgt_dtype=torch.float16):
     batch = {}
     batch_uc = {}
 
@@ -397,18 +403,18 @@ def get_batch(keys, value_dict, N, T, device):
         if key == "fps_id":
             batch[key] = (
                 torch.tensor([value_dict["fps_id"]])
-                .to(device)
+                .to(device, dtype=wgt_dtype)
                 .repeat(int(math.prod(N)))
             )
         elif key == "motion_bucket_id":
             batch[key] = (
                 torch.tensor([value_dict["motion_bucket_id"]])
-                .to(device)
+                .to(device, dtype=wgt_dtype)
                 .repeat(int(math.prod(N)))
             )
         elif key == "cond_aug":
             batch[key] = repeat(
-                torch.tensor([value_dict["cond_aug"]]).to(device),
+                torch.tensor([value_dict["cond_aug"]]).to(device, dtype=wgt_dtype),
                 "1 -> b",
                 b=math.prod(N),
             )
@@ -416,7 +422,7 @@ def get_batch(keys, value_dict, N, T, device):
             batch[key] = repeat(value_dict[key], "bs ... -> bs b ...", b=N[0], bs=value_dict[key].shape[0])
             batch[key] = rearrange(batch[key], "bs b ... -> (bs b) ...")
         elif key == "polars_rad" or key == "azimuths_rad":
-            batch[key] = torch.tensor(value_dict[key]).to(device).repeat(N[0])
+            batch[key] = torch.tensor(value_dict[key]).to(device, dtype=wgt_dtype).repeat(N[0])
         else:
             batch[key] = value_dict[key]
 
@@ -454,7 +460,10 @@ def load_model(
     device: str
 ):
     if device == "cuda":
-        with torch.device(device):
+        if version.parse(torch.__version__) >= version.parse("2.0.0"):
+            with torch.device(device):
+                model = instantiate_from_config(config.model).to(device).eval()
+        else:
             model = instantiate_from_config(config.model).to(device).eval()
     else:
         model = instantiate_from_config(config.model).to(device).eval()
@@ -484,6 +493,7 @@ def do_inference(accelerator, model, batch, shape, num_frames, device, uc, c, de
                 print(f"cuda OOM error occured at batch size {shape[0]//num_frames}!")
                 return None
             model.en_and_decode_n_samples_a_time = decoding_t
+            samples_z = samples_z.to(dtype=torch.float16)
             samples_x = model.decode_first_stage(samples_z)
             # Reshape samples_x to be of shape (bs, num_frames, C, H, W)
             samples_x = rearrange(samples_x, "(bs t) c h w -> bs t c h w", t=num_frames)
@@ -557,11 +567,18 @@ def get_inference_memory(accelerator, model, batch, shape, num_frames, device, u
         outputs = do_inference(accelerator, model, batch, shape, num_frames, device, uc, c, decoding_t)
     
     if outputs is None: # cuda OOM error occured
-        return -1
+        return {'peak_mem':-1, 'reserved_mem':-1}
     
     # Get the peak memory usage
-    mem = torch.cuda.max_memory_reserved(device)
-    return round(mem / 1e9, 2)  # Convert bytes to GB and round off
+    peak_mem = torch.cuda.max_memory_reserved(device)
+    reserved_mem = torch.cuda.memory_reserved()
+    
+    output = {
+        "peak_mem": round(peak_mem/1e9, 2),
+        "reserved_mem": round(reserved_mem/1e9, 2)
+    }
+    
+    return output  # Convert bytes to GB and round off
 
 
 if __name__ == "__main__":

@@ -7,7 +7,7 @@ import torch
 import torch.nn.functional as F
 from einops import rearrange, repeat
 from packaging import version
-from torch import nn
+from torch import nn, einsum
 from torch.utils.checkpoint import checkpoint
 
 logpy = logging.getLogger(__name__)
@@ -32,7 +32,7 @@ if version.parse(torch.__version__) >= version.parse("2.0.0"):
             "enable_flash": False,
             "enable_mem_efficient": True,
         },
-        None: {"enable_math": True, "enable_flash": True, "enable_mem_efficient": True},
+        None: {"enable_math": True, "enable_flash": True, "enable_mem_efficient": False},
     }
 else:
     from contextlib import nullcontext
@@ -313,23 +313,24 @@ class CrossAttention(nn.Module):
         q, k, v = map(lambda t: rearrange(t, "b n (h d) -> b h n d", h=h), (q, k, v))
 
         ## old
-        """
-        sim = einsum('b i d, b j d -> b i j', q, k) * self.scale
-        del q, k
+        # print("q/k shape:", q.shape, k.shape)
+        # sim = einsum('b i d, b j d -> b i j', q, k) * self.scale
+        # del q, k
 
-        if exists(mask):
-            mask = rearrange(mask, 'b ... -> b (...)')
-            max_neg_value = -torch.finfo(sim.dtype).max
-            mask = repeat(mask, 'b j -> (b h) () j', h=h)
-            sim.masked_fill_(~mask, max_neg_value)
+        # if exists(mask):
+        #     mask = rearrange(mask, 'b ... -> b (...)')
+        #     max_neg_value = -torch.finfo(sim.dtype).max
+        #     mask = repeat(mask, 'b j -> (b h) () j', h=h)
+        #     sim.masked_fill_(~mask, max_neg_value)
 
-        # attention, what we cannot get enough of
-        sim = sim.softmax(dim=-1)
+        # # attention, what we cannot get enough of
+        # sim = sim.softmax(dim=-1)
 
-        out = einsum('b i j, b j d -> b i d', sim, v)
-        """
+        # out = einsum('b i j, b j d -> b i d', sim, v)
+        
         ## new
-        with sdp_kernel(**BACKEND_MAP[self.backend]):
+        # print(BACKEND_MAP[self.backend])
+        with sdp_kernel(enable_math=True, enable_flash=False, enable_mem_efficient=False):
             # print("dispatching into backend", self.backend, "q/k/v shape: ", q.shape, k.shape, v.shape)
             out = F.scaled_dot_product_attention(
                 q, k, v, attn_mask=mask
@@ -496,7 +497,8 @@ class BasicTransformerBlock(nn.Module):
                 ), "Please install xformers via e.g. 'pip install xformers==0.0.16'"
             else:
                 logpy.info("Falling back to xformers efficient attention.")
-                attn_mode = "softmax-xformers"
+                attn_mode = "softmax"
+        
         attn_cls = self.ATTENTION_MODES[attn_mode]
         if version.parse(torch.__version__) >= version.parse("2.0.0"):
             assert sdp_backend is None or isinstance(sdp_backend, SDPBackend)

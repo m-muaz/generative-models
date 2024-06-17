@@ -313,7 +313,7 @@ if __name__ == "__main__":
     # test02()
     # test03()
 
-    # benchmark_attn()
+    benchmark_attn()
     benchmark_transformer_blocks()
 
     print("done.")
